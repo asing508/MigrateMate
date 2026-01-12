@@ -1,0 +1,98 @@
+# MigrateMate Docker Compose Configuration
+# This file orchestrates all our database services
+
+version: "3.9"
+
+services:
+  # ============================================
+  # PostgreSQL - Structured Metadata Storage
+  # ============================================
+  # WHY: Stores migration jobs, user accounts, audit logs.
+  # PostgreSQL is ACID-compliant, perfect for transactional data.
+  postgres:
+    image: postgres:16-alpine
+    container_name: migratemate-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-migratemate}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-migratemate_secret}
+      POSTGRES_DB: ${POSTGRES_DB:-migratemate_db}
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-migratemate} -d ${POSTGRES_DB:-migratemate_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ============================================
+  # Qdrant - Vector Database for Semantic Search
+  # ============================================
+  # WHY: Stores code embeddings for similarity search.
+  # When you search "function that handles user auth", Qdrant
+  # finds semantically similar code even without exact keyword matches.
+  qdrant:
+    image: qdrant/qdrant:v1.9.0
+    container_name: migratemate-qdrant
+    restart: unless-stopped
+    ports:
+      - "7333:6333"  # Changed host port from 6333 to 7333
+      - "7334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    environment:
+      QDRANT__SERVICE__GRPC_PORT: 6334
+      QDRANT__SERVICE__HTTP_PORT: 6333
+
+  # ============================================
+  # Neo4j - Graph Database for Dependency Mapping
+  # ============================================
+  # WHY: Maps code structure as a graph. Nodes = functions/classes,
+  # Edges = calls/imports. This lets us ask "what breaks if I change X?"
+  neo4j:
+    image: neo4j:5.18-community
+    container_name: migratemate-neo4j
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:-migratemate_neo4j}
+      NEO4J_PLUGINS: '["apoc", "graph-data-science"]'
+      NEO4J_dbms_security_procedures_unrestricted: "apoc.*,gds.*"
+      NEO4J_dbms_security_procedures_allowlist: "apoc.*,gds.*"
+    ports:
+      - "9474:7474"  # HTTP Browser UI
+      - "9687:7687"  # Bolt protocol (driver connections)
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+
+  # ============================================
+  # Redis - Caching & Agent Memory
+  # ============================================
+  # WHY: Lightning-fast in-memory store. We use it for:
+  # 1. Caching expensive LLM calls
+  # 2. Storing agent conversation state
+  # 3. Rate limiting API requests
+  redis:
+    image: redis:7-alpine
+    container_name: migratemate-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-migratemate_redis}
+    ports:
+      - "6389:6379"
+    volumes:
+      - redis_data:/data
+
+# Named volumes persist data across container restarts
+volumes:
+  postgres_data:
+  qdrant_data:
+  neo4j_data:
+  neo4j_logs:
+  redis_data:
+
+# Custom network for service communication
+networks:
+  default:
+    name: migratemate-network
