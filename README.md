@@ -174,4 +174,4 @@ MIT - do whatever you want with it.
 
 ---
 
-Built by [Aditya Sharma](https://github.com/adityaShar24) as a portfolio project demonstrating AI-powered code transformation.
+Built by [Aditya Singh](https://github.com/asing508) as a portfolio project demonstrating AI-powered code transformation.
