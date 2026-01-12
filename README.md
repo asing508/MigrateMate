@@ -160,14 +160,6 @@ This is a portfolio project, so there are some rough edges:
 - AST parsing is great for structure, but regex is still useful for quick pattern fixes
 - The 80/20 rule applies: 80% of files migrate cleanly, 20% need the most work
 
-## Future Ideas
-
-- [ ] Cross-file dependency analysis (know that router X calls controller Y)
-- [ ] Pydantic model generation from request body patterns  
-- [ ] Test file migration (pytest fixtures, Flask test client → FastAPI TestClient)
-- [ ] Support for Flask-SQLAlchemy → SQLAlchemy async patterns
-- [ ] Django → FastAPI migration path
-
 ## License
 
 MIT - do whatever you want with it.
