@@ -3,7 +3,12 @@
 MigrateMate is an automated tool that modernizes your Python web applications by converting them from Flask to FastAPI. Instead of rewriting code by hand, you simply upload your project, and the tool uses AI to intelligently translate it. It handles the hard work for you—like updating how your app handles web requests, fixing imports, and making your code run faster with modern features—ensuring the new version works correctly.
 
 Key Simplifications Made:
-"Neuro-symbolic" $\rightarrow$ "Combines AI with strict code rules""AST-driven parsing" $\rightarrow$ "Understanding your code's structure""RAG-ready" $\rightarrow$ "Context-aware" (implied)"Deterministic validation" $\rightarrow$ "Double-checks the results""Asynchronous I/O" $\rightarrow$ "Making your code run faster"
+
+"Neuro-symbolic" $\rightarrow$ "Combines AI with strict code rules"
+"AST-driven parsing" $\rightarrow$ "Understanding your code's structure"
+"RAG-ready" $\rightarrow$ "Context-aware" (implied)
+"Deterministic validation" $\rightarrow$ "Double-checks the results"
+"Asynchronous I/O" $\rightarrow$ "Making your code run faster"
 
 ## Why I Built This
 
