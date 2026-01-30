@@ -37,10 +37,28 @@ The tool handles real-world Flask patterns:
 - Python 3.10+
 - Node.js 18+ (for the frontend)
 - Google Gemini API key ([get one here](https://makersuite.google.com/app/apikey))
+- Docker Desktop (optional, for PostgreSQL/Redis/Neo4j/Qdrant services)
+
+### Docker Setup (Optional Services)
+
+If you want to use PostgreSQL, Redis, Neo4j, or Qdrant:
+
+```bash
+# From the backend directory
+cd backend
+docker compose up -d
+
+# Verify services are running (you should see postgres, qdrant, redis, neo4j)
+docker ps
+
+# To stop services when done
+docker compose down
+```
 
 ### Backend Setup
 
 ```bash
+# Navigate to backend directory (if not already there)
 cd backend
 
 # Create and activate virtual environment
@@ -55,13 +73,15 @@ pip install -r requirements.txt
 cp .env.example .env
 # Edit .env and add your GEMINI_API_KEY
 
-# Run the server
+# Run the server (this takes a moment to start)
 uvicorn app.main:app --reload --port 8000
+# Wait until you see: 🎉 MigrateMate is ready!
 ```
 
 ### Frontend Setup
 
 ```bash
+# Navigate to frontend directory
 cd frontend
 
 # Install dependencies
@@ -77,11 +97,18 @@ Open http://localhost:3000 and you're good to go.
 
 ### Option 1: GitHub Repository
 
-Enter a GitHub URL like `https://github.com/username/flask-app.git`, pick a branch, and click migrate. The tool clones the repo, finds all Python files, and processes them.
+1. Enter a GitHub URL like `https://github.com/username/flask-app` (not `.git`)
+2. Select the branch you want to migrate
+3. Click "Start Migration"
+
+The tool clones the repo, finds all Python files, and processes them.
 
 ### Option 2: ZIP Upload
 
-Upload a ZIP file of your Flask project. Same process, just local files instead of cloning.
+1. Upload a ZIP file of your Flask project
+2. Click "Start Migration"
+
+Same process, just local files instead of cloning.
 
 ### What You Get
 
