@@ -433,100 +433,101 @@ class BatchMigrationService:
         )
     
     def _post_process_main_app(self, code: str, source_code: str) -> str:
+        """Special post-processing for main app files (app.py).
+
+        Handles import collisions when multiple blueprint modules each get
+        re-exported as `router` after migration, and rewrites
+        `app.register_blueprint(<bp>)` to `app.include_router(<bp>)` using the
+        ORIGINAL blueprint variable names from the Flask source.
+
+        Generalised: works for any `from <pkg.path> import <name>` (not just
+        `from routes.<X>`), and accepts blueprint variables that don't end in
+        `_bp` by matching against the actual Blueprint(...) declarations in the
+        source.
         """
-        Special post-processing for main app files (app.py).
-        Handles import collisions and router naming.
-        """
-        # Extract original blueprint names and their associated imports from source code
-        # Pattern: from routes.user_router import auth_bp, cache
-        # Pattern: from routes.request_router import request_bp
-        original_imports = re.findall(
-            r'from\s+routes\.(\w+)\s+import\s+([^\n]+)',
-            source_code
+        # 1) Authoritative blueprint names come from BOTH places they appear in
+        #    the original source: `Blueprint(...)` declarations (when they live
+        #    in this file) AND `register_blueprint(<name>)` calls (when they
+        #    were imported from submodules — the typical multi-file layout).
+        bp_vars_in_source = set(
+            re.findall(r'(\w+)\s*=\s*Blueprint\s*\(', source_code)
         )
-        
-        # Create mapping: routes module -> (blueprint_name, additional_imports)
-        # e.g., {'user_router': ('auth_bp', ['cache']), 'request_router': ('request_bp', [])}
-        bp_name_map = {}
+        bp_vars_in_source |= set(
+            re.findall(r'\.register_blueprint\(\s*(\w+)', source_code)
+        )
+
+        # 2) Collect every `from X import ...` line in the source so we can map
+        #    "module path -> (blueprint_name, [other_imports])".
+        original_imports = re.findall(
+            r'from\s+([\w\.]+)\s+import\s+([^\n]+)',
+            source_code,
+        )
+
+        bp_name_map: dict[str, tuple[str, list[str]]] = {}
         for module, imports_str in original_imports:
-            imports = [i.strip() for i in imports_str.split(',')]
+            imports = [i.strip() for i in imports_str.split(',') if i.strip()]
             bp_name = None
             additional = []
             for imp in imports:
-                if imp.endswith('_bp'):
+                # Prefer matching against the authoritative bp name set; fall
+                # back to the `_bp`/`_blueprint` suffix heuristic only if we
+                # have nothing better.
+                is_bp = (
+                    imp in bp_vars_in_source
+                    or (not bp_vars_in_source and (imp.endswith('_bp') or imp.endswith('_blueprint')))
+                )
+                if is_bp and bp_name is None:
                     bp_name = imp
                 else:
                     additional.append(imp)
             if bp_name:
                 bp_name_map[module] = (bp_name, additional)
-        
-        # Find all router imports in migrated code that need fixing
-        # Pattern: from routes.user_router import router
-        router_import_pattern = r'from\s+routes\.(\w+)\s+import\s+router([^\w]|$)'
-        router_modules = re.findall(router_import_pattern, code)
-        
-        if router_modules:
-            # We have collision - multiple 'router' imports
-            for module, _ in router_modules:
-                if module in bp_name_map:
-                    bp_name, additional = bp_name_map[module]
-                    
-                    # Build the correct import statement
-                    all_imports = [bp_name] + additional
-                    new_import = f"from routes.{module} import {', '.join(all_imports)}"
-                    
-                    # Fix the import statement - handle various patterns
-                    # Pattern 1: from routes.X import router (end of line)
-                    code = re.sub(
-                        rf'from\s+routes\.{module}\s+import\s+router\s*$',
-                        new_import,
-                        code,
-                        flags=re.MULTILINE
-                    )
-                    # Pattern 2: from routes.X import router, something
-                    code = re.sub(
-                        rf'from\s+routes\.{module}\s+import\s+router\s*,',
-                        f'from routes.{module} import {bp_name},',
-                        code
-                    )
-                    # Pattern 3: from routes.X import router (followed by newline or something)
-                    code = re.sub(
-                        rf'from\s+routes\.{module}\s+import\s+router(\s)',
-                        rf'from routes.{module} import {bp_name}\1',
-                        code
-                    )
-                else:
-                    # No mapping found, create a reasonable name
-                    bp_name = f"{module.replace('_router', '')}_bp"
-                    code = re.sub(
-                        rf'from\s+routes\.{module}\s+import\s+router(\s|$)',
-                        rf'from routes.{module} import {bp_name}\1',
-                        code,
-                        flags=re.MULTILINE
-                    )
-        
-        # Now fix the include_router calls
-        # Find the original order from source code
-        original_bp_order = re.findall(
-            r'app\.register_blueprint\((\w+)\)',
-            source_code
+
+        # 3) Find every `from <module> import router[, ...]` collision in the
+        #    migrated code and rewrite using the original bp name.
+        router_modules = set(
+            re.findall(r'from\s+([\w\.]+)\s+import\s+router(?:[^\w]|$)', code)
         )
-        
-        # Replace generic include_router(router) calls with correct names in order
-        if original_bp_order:
-            for original_bp in original_bp_order:
-                # Replace one occurrence at a time
+
+        for module in router_modules:
+            if module in bp_name_map:
+                bp_name, additional = bp_name_map[module]
+                all_imports = [bp_name] + additional
+                new_import = f"from {module} import {', '.join(all_imports)}"
+
+                # Replace the entire `from <module> import ...router...` line.
                 code = re.sub(
-                    r'app\.include_router\(router\)',
-                    f'app.include_router({original_bp})',
+                    rf'^from\s+{re.escape(module)}\s+import\s+[^\n]*\brouter\b[^\n]*$',
+                    new_import,
                     code,
-                    count=1
+                    flags=re.MULTILINE,
                 )
-        
-        # Apply standard post-processing
-        code = self._post_process(code)
-        
-        return code
+            else:
+                # Synthesize a reasonable name from the trailing module segment.
+                last = module.rsplit('.', 1)[-1]
+                bp_name = f"{last.replace('_router', '').replace('_routes', '')}_bp"
+                code = re.sub(
+                    rf'(^from\s+{re.escape(module)}\s+import\s+)router\b',
+                    rf'\1{bp_name}',
+                    code,
+                    flags=re.MULTILINE,
+                )
+
+        # 4) Fix `app.include_router(router)` calls. Use the ORIGINAL
+        #    register_blueprint(...) order from the source for correctness.
+        original_bp_order = re.findall(
+            r'\.register_blueprint\(\s*(\w+)',
+            source_code,
+        )
+        for original_bp in original_bp_order:
+            code = re.sub(
+                r'\.include_router\(\s*router\s*([,\)])',
+                lambda m, name=original_bp: f'.include_router({name}{m.group(1)}',
+                code,
+                count=1,
+            )
+
+        return self._post_process(code)
     
     def _generate_fastapi_header(self) -> str:
         """Generate FastAPI file header."""
@@ -547,11 +548,22 @@ app = FastAPI(title="Migrated API")
         code = code.replace("'Welcome to Flask", "'Welcome to FastAPI")
         
         # 2. Fix any remaining Flask patterns that the agent might have missed
-        # Blueprint to APIRouter - but PRESERVE the variable name!
+        # Blueprint to APIRouter - but PRESERVE the variable name! Allow extra
+        # kwargs like url_prefix='/auth', template_folder='...', static_folder='...'.
+        def _bp_to_router(m: 're.Match') -> str:
+            var = m.group(1)
+            tag = m.group(2)
+            extra = m.group(3) or ''
+            url_prefix_match = re.search(r"url_prefix\s*=\s*['\"]([^'\"]+)['\"]", extra)
+            kwargs = [f"tags=['{tag}']"]
+            if url_prefix_match:
+                kwargs.append(f"prefix='{url_prefix_match.group(1)}'")
+            return f"{var} = APIRouter({', '.join(kwargs)})"
+
         code = re.sub(
-            r"(\w+)\s*=\s*Blueprint\s*\(\s*['\"](\w+)['\"],\s*__name__\s*\)",
-            r"\1 = APIRouter(tags=['\2'])",
-            code
+            r"(\w+)\s*=\s*Blueprint\s*\(\s*['\"]([\w\.]+)['\"]\s*,\s*__name__([^)]*)\)",
+            _bp_to_router,
+            code,
         )
         
         # 3. Fix register_blueprint to include_router
@@ -630,13 +642,17 @@ app = FastAPI(title="Migrated API")
         # 11. Remove excessive blank lines (more than 2)
         code = re.sub(r'\n{4,}', '\n\n\n', code)
         
-        # 12. Remove duplicate imports
+        # 12. Remove duplicate TOP-LEVEL imports (preserve indented function-local imports)
         lines = code.split('\n')
         seen_imports = set()
         result = []
         for line in lines:
             stripped = line.strip()
-            if stripped.startswith('from ') or stripped.startswith('import '):
+            is_top_level_import = (
+                (line.startswith('from ') or line.startswith('import '))
+                and (stripped.startswith('from ') or stripped.startswith('import '))
+            )
+            if is_top_level_import:
                 normalized = stripped.replace('  ', ' ')
                 if normalized not in seen_imports:
                     seen_imports.add(normalized)
@@ -655,19 +671,23 @@ app = FastAPI(title="Migrated API")
         return code
     
     def _organize_imports(self, code: str) -> str:
-        """Organize imports to be at the top of the file."""
+        """Organize TOP-LEVEL imports to be at the top of the file.
+
+        Only unindented imports are hoisted; indented imports inside functions
+        (used for lazy loading or to avoid circular imports) stay in place.
+        """
         lines = code.split('\n')
-        
+
         import_lines = []
         other_lines = []
         docstring_lines = []
         comment_lines = []  # TODO comments at the top
         in_docstring = False
         docstring_done = False
-        
+
         for i, line in enumerate(lines):
             stripped = line.strip()
-            
+
             # Handle module docstrings at the start
             if not docstring_done:
                 if stripped.startswith('"""') or stripped.startswith("'''"):
@@ -684,9 +704,15 @@ app = FastAPI(title="Migrated API")
                     continue
                 else:
                     docstring_done = True
-            
-            # Categorize lines
-            if stripped.startswith('from ') or stripped.startswith('import '):
+
+            # Only hoist UNINDENTED imports — leaving function-local imports
+            # (which are intentionally lazy / break circular deps) where they are.
+            is_top_level_import = (
+                (line.startswith('from ') or line.startswith('import '))
+                and (stripped.startswith('from ') or stripped.startswith('import '))
+            )
+
+            if is_top_level_import:
                 import_lines.append(line)
             elif stripped.startswith('# TODO:') and not other_lines:
                 # Keep TODO comments near the top if they're before any code

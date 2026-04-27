@@ -76,29 +76,46 @@ class GitHubService:
         return clone_path
     
     def find_python_files(self, repo_path: str, exclude_patterns: List[str] = None) -> List[str]:
-        """Find all Python files in a repository."""
+        """Find all Python files in a repository.
+
+        Exclusions are matched against PATH SEGMENTS or via fnmatch globs, not
+        as raw substrings — so excluding `tests` no longer drops files like
+        `pytest_helpers.py` (where `tests` is a substring).
+        """
+        import fnmatch
+
         exclude_patterns = exclude_patterns or [
             '__pycache__', '.git', 'venv', 'env', '.env',
             'node_modules', '.pytest_cache', '*.pyc', 'migrations',
             'tests', 'test_*', '*_test.py'
         ]
-        
+
         python_files = []
         repo_path = Path(repo_path)
-        
+
         for py_file in repo_path.rglob('*.py'):
             relative = py_file.relative_to(repo_path)
-            
-            # Check exclusions
+            parts = relative.parts
+            filename = relative.name
+
             skip = False
             for pattern in exclude_patterns:
-                if pattern in str(relative):
-                    skip = True
-                    break
-            
+                if '*' in pattern or '?' in pattern:
+                    # Glob: match against the filename and against any segment.
+                    if fnmatch.fnmatch(filename, pattern) or any(
+                        fnmatch.fnmatch(p, pattern) for p in parts
+                    ):
+                        skip = True
+                        break
+                else:
+                    # Plain name: must match a full path segment, not a substring.
+                    if pattern in parts or filename == pattern:
+                        skip = True
+                        break
+
             if not skip:
                 python_files.append(str(py_file))
-        
+
         return sorted(python_files)
     
     def read_file(self, file_path: str, repo_path: str) -> RepoFile:

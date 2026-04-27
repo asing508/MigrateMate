@@ -321,16 +321,17 @@ Return ONLY the migrated Python code, no explanations or markdown code blocks.""
         return None
     
     def _clean_code_response(self, code: str) -> str:
-        """Clean up LLM response to extract pure Python code."""
-        # Remove markdown code blocks if present
-        if code.startswith("```python"):
-            code = code[9:]
-        elif code.startswith("```"):
-            code = code[3:]
-        
-        if code.endswith("```"):
-            code = code[:-3]
-        
+        """Clean up LLM response to extract pure Python code.
+
+        Strips opening fences like ```python, ```py, ```python3, etc., and the
+        trailing ``` — and also handles fences that aren't at offset 0 because
+        the model added a blank line first.
+        """
+        code = code.strip()
+        # Opening fence: ``` followed by optional language tag on the same line
+        code = re.sub(r'^```[a-zA-Z0-9_+-]*[ \t]*\n?', '', code)
+        # Trailing fence
+        code = re.sub(r'\n?```[ \t]*$', '', code)
         return code.strip()
     
     def _migrate_with_patterns(self, code: str) -> str:
@@ -340,46 +341,71 @@ Return ONLY the migrated Python code, no explanations or markdown code blocks.""
         
         # ===== PHASE 1: Detect what's needed before modifying =====
         needs_json = 'json.loads' in result or 'json.dumps' in result
-        uses_request_data = 'request.data' in result or 'request.json' in result or 'request.form' in result
-        has_flask_imports = 'from flask import' in result
-        
-        # Track blueprint variable names for consistent handling
-        blueprint_vars = re.findall(r'(\w+)\s*=\s*Blueprint\s*\(', result)
         
         # ===== PHASE 2: Handle Flask Imports =====
         def transform_imports(match):
             imports = match.group(1).split(',')
             imports = [i.strip() for i in imports]
-            
+
             fastapi_imports = []
             extra_lines = []
-            
+            unknown = []  # Flask symbols with no FastAPI equivalent — surface as TODO
+
             for imp in imports:
-                if imp == 'Flask': 
+                if imp == 'Flask':
                     fastapi_imports.append('FastAPI')
-                elif imp == 'Blueprint': 
+                elif imp == 'Blueprint':
                     fastapi_imports.append('APIRouter')
-                elif imp == 'request': 
+                elif imp == 'request':
                     fastapi_imports.append('Request')
-                elif imp == 'make_response': 
+                elif imp == 'make_response':
                     extra_lines.append('from fastapi.responses import JSONResponse')
-                elif imp == 'jsonify': 
-                    pass  # Will be handled separately
-                elif imp == 'json': 
-                    extra_lines.append('import json')  # Keep json import
+                elif imp == 'jsonify':
+                    pass  # Removed — FastAPI returns dicts directly
+                elif imp == 'json':
+                    extra_lines.append('import json')
                 elif imp == 'abort':
                     fastapi_imports.append('HTTPException')
                 elif imp == 'redirect':
                     extra_lines.append('from fastapi.responses import RedirectResponse')
-                elif imp == 'Depends' or imp == 'Query' or imp == 'Path':
+                elif imp == 'Response':
+                    extra_lines.append('from fastapi.responses import Response')
+                elif imp == 'render_template':
+                    extra_lines.append(
+                        'from fastapi.templating import Jinja2Templates  '
+                        '# TODO: configure Jinja2Templates(directory="templates") and pass `request` to TemplateResponse'
+                    )
+                elif imp == 'send_file':
+                    extra_lines.append('from fastapi.responses import FileResponse  # TODO: replace send_file() calls with FileResponse(path)')
+                elif imp == 'send_from_directory':
+                    extra_lines.append('from fastapi.responses import FileResponse  # TODO: replace send_from_directory() with FileResponse(os.path.join(directory, filename))')
+                elif imp == 'url_for':
+                    extra_lines.append("# TODO: Flask url_for() has no direct FastAPI equivalent — use request.url_for('route_name')")
+                elif imp == 'session':
+                    extra_lines.append("# TODO: Flask session removed — add starlette SessionMiddleware and use request.session")
+                elif imp == 'g':
+                    extra_lines.append("# TODO: Flask `g` removed — use request.state for per-request storage")
+                elif imp == 'current_app':
+                    extra_lines.append("# TODO: Flask current_app removed — inject the app via dependency or import directly")
+                elif imp == 'flash':
+                    extra_lines.append("# TODO: Flask flash() removed — implement message flashing via session or response cookies")
+                elif imp == 'get_flashed_messages':
+                    extra_lines.append("# TODO: Flask get_flashed_messages() removed — read from session/cookies")
+                elif imp in ('Depends', 'Query', 'Path'):
                     fastapi_imports.append(imp)
-            
+                else:
+                    # Don't silently drop — preserve as TODO so caller code that
+                    # references the symbol fails loudly rather than mysteriously.
+                    unknown.append(imp)
+
             lines = []
             if fastapi_imports:
                 lines.append(f"from fastapi import {', '.join(fastapi_imports)}")
             lines.extend(extra_lines)
+            if unknown:
+                lines.append(f"# TODO: No FastAPI equivalent for flask import(s): {', '.join(unknown)}")
             return '\n'.join(lines) if lines else ''
-            
+
         result = re.sub(r'from flask import ([^\n]+)', transform_imports, result)
         
         # ===== PHASE 3: Add necessary imports =====
@@ -454,40 +480,38 @@ Return ONLY the migrated Python code, no explanations or markdown code blocks.""
         )
         
         # ===== PHASE 11: Async Functions with Request Parameter =====
-        # If the function uses request, it needs request: Request as parameter
-        # Note: We check uses_request_data from original, but also check result after conversion
-        uses_request_after_convert = 'await request.' in result or 'request.query_params' in result
-        if uses_request_data or uses_request_after_convert:
-            # Find all function definitions and check if they use request
-            def add_request_param(match):
-                func_name = match.group(1)
-                # Check if this function uses request in the RESULT code (after conversion)
-                # This is more reliable since request.data is already converted to await request.body()
-                func_pattern = rf'def {func_name}\s*\([^)]*\):[^\n]*\n((?:[ \t]+[^\n]*\n)*)'
-                func_match = re.search(func_pattern, result, re.MULTILINE)
-                if func_match:
-                    func_body = func_match.group(1) if func_match.group(1) else ''
-                    if 'request.' in func_body or 'await request.' in func_body:
-                        return f'async def {func_name}(request: Request):'
-                # Also check original code for request usage
-                func_match_orig = re.search(func_pattern, original_code, re.MULTILINE)
-                if func_match_orig:
-                    func_body = func_match_orig.group(1) if func_match_orig.group(1) else ''
-                    if 'request.' in func_body or 'request.data' in func_body or 'request.json' in func_body:
-                        return f'async def {func_name}(request: Request):'
-                return f'async def {func_name}():'
-            
-            # Convert def to async def and add request param where needed
-            result = re.sub(
-                r'^def (\w+)\s*\(\s*\)\s*:',
-                add_request_param,
-                result,
-                flags=re.MULTILINE
-            )
-        else:
-            # Just convert to async
-            result = re.sub(r'^def (\w+)\s*\(\s*\)\s*:', r'async def \1():', result, flags=re.MULTILINE)
-        
+        # Convert ALL `def name(...)` to `async def name(...)` (including param'd
+        # functions like `def get_user(user_id):`). Add `request: Request` only
+        # when the function actually uses `request.` and doesn't already have it.
+        def to_async(match):
+            indent = match.group(1)
+            func_name = match.group(2)
+            params = match.group(3)
+            # Determine if this function body uses request (look ahead in source).
+            # We check both original_code and the in-progress result.
+            def body_uses_request(src: str) -> bool:
+                m = re.search(
+                    rf'def {re.escape(func_name)}\s*\([^)]*\)\s*:[^\n]*\n((?:[ \t]+[^\n]*\n?)*)',
+                    src,
+                )
+                body = m.group(1) if m else ''
+                return ('request.' in body) or ('await request.' in body)
+
+            uses_req = body_uses_request(result) or body_uses_request(original_code)
+
+            # Only inject `request: Request` if body uses request AND it's not already present.
+            if uses_req and 'request' not in params:
+                new_params = 'request: Request' if not params.strip() else f'{params.strip()}, request: Request'
+                return f'{indent}async def {func_name}({new_params}):'
+            return f'{indent}async def {func_name}({params}):'
+
+        result = re.sub(
+            r'^([ \t]*)def\s+(\w+)\s*\(([^)]*)\)\s*:',
+            to_async,
+            result,
+            flags=re.MULTILINE,
+        )
+
         result = result.replace('async async def', 'async def')
         
         # ===== PHASE 12: Request data access =====
@@ -526,8 +550,36 @@ Return ONLY the migrated Python code, no explanations or markdown code blocks.""
         )
         
         # ===== PHASE 17: Response handling =====
-        # Remove jsonify() wrapper - FastAPI returns dicts directly
-        result = re.sub(r'jsonify\s*\(\s*([^)]+)\s*\)', r'\1', result)
+        # Remove jsonify() wrapper — FastAPI returns dicts directly. Handle
+        # nested parens (e.g., jsonify(serialize(user))) by walking the string
+        # character-by-character to find the matching close paren.
+        def strip_jsonify(text: str) -> str:
+            out = []
+            i = 0
+            n = len(text)
+            while i < n:
+                # Look for the literal `jsonify(` not preceded by a word char
+                m = re.match(r'jsonify\s*\(', text[i:])
+                if m and (i == 0 or not text[i - 1].isalnum() and text[i - 1] != '_'):
+                    start = i + m.end()
+                    depth = 1
+                    j = start
+                    while j < n and depth > 0:
+                        c = text[j]
+                        if c == '(':
+                            depth += 1
+                        elif c == ')':
+                            depth -= 1
+                        j += 1
+                    if depth == 0:
+                        out.append(text[start:j - 1].strip())  # inner expression, drop the trailing `)`
+                        i = j
+                        continue
+                out.append(text[i])
+                i += 1
+            return ''.join(out)
+
+        result = strip_jsonify(result)
         
         # FIX: Robust make_response handling (Handles single arg, dicts, and status codes)
         # 1. Handle make_response({'a':1}, 200) - capture balanced braces
@@ -587,56 +639,57 @@ Return ONLY the migrated Python code, no explanations or markdown code blocks.""
         result = re.sub(r'\n\s*\n\s*\n', '\n\n', result)
         
         # ===== PHASE 22: Ensure request parameter is added where needed =====
-        # Final pass: check if any function still uses request without having it as a parameter
+        # Final pass: check if any function still uses request without having it as a parameter.
+        # Now matches functions with arbitrary parameters, and only injects `request: Request`
+        # when it's missing AND the body actually uses `request.`.
         lines = result.split('\n')
         new_lines = []
         i = 0
         while i < len(lines):
             line = lines[i]
-            # Check if this is a function definition without request parameter
-            func_match = re.match(r'^(\s*)(async\s+)?def\s+(\w+)\s*\(\s*\)\s*:', line)
+            func_match = re.match(r'^(\s*)(async\s+)?def\s+(\w+)\s*\(([^)]*)\)\s*:', line)
             if func_match:
                 indent = func_match.group(1)
                 async_part = func_match.group(2) or ''
                 func_name = func_match.group(3)
+                params = func_match.group(4)
                 func_indent_len = len(indent)
-                
+
                 # Look ahead to check if function body uses request
                 j = i + 1
                 uses_request = False
                 while j < len(lines):
                     next_line = lines[j]
                     next_stripped = next_line.strip()
-                    
-                    # Skip empty lines
+
                     if not next_stripped:
                         j += 1
                         continue
-                    
-                    # Calculate indentation of this line
+
                     next_indent_len = len(next_line) - len(next_line.lstrip())
-                    
-                    # If we hit a line at same or less indentation, we've left the function
+
+                    # Exit when we leave the function body
                     if next_indent_len <= func_indent_len and next_stripped:
-                        # Check if it's a decorator or another def - those would start a new function
-                        if next_stripped.startswith('@') or next_stripped.startswith('def ') or next_stripped.startswith('async def ') or next_stripped.startswith('class '):
+                        if (next_stripped.startswith('@')
+                            or next_stripped.startswith('def ')
+                            or next_stripped.startswith('async def ')
+                            or next_stripped.startswith('class ')):
                             break
-                        # For top-level functions (indent_len=0), any non-indented line exits
                         if func_indent_len == 0:
                             break
-                    
-                    # Check for request usage in this line
+
                     if 'request.' in next_line or 'await request.' in next_line:
                         uses_request = True
                         break
                     j += 1
-                
-                if uses_request:
-                    line = f'{indent}{async_part}def {func_name}(request: Request):'
-            
+
+                if uses_request and 'request' not in params:
+                    new_params = 'request: Request' if not params.strip() else f'{params.strip()}, request: Request'
+                    line = f'{indent}{async_part}def {func_name}({new_params}):'
+
             new_lines.append(line)
             i += 1
-        
+
         result = '\n'.join(new_lines)
         
         # ===== PHASE 23: Fix Route Wrappers to pass request (Improved) =====
@@ -649,29 +702,56 @@ Return ONLY the migrated Python code, no explanations or markdown code blocks.""
             func_name = match.group(2)
             indent = match.group(3)
             called_func = match.group(4)
-            
-            # If the wrapper already has request, ignore
-            if 'request' in func_name: 
-                return match.group(0)
-                
-            return f"{decorator}async def {func_name}(request: Request):\n{indent}return await {called_func}(request)"
+            existing_args = (match.group(5) or '').strip()
 
-        # Regex explanation:
-        # 1. Decorator line (@....)
-        # 2. Function def (async def name():)
-        # 3. Indentation and return (return (await)? name())
+            # Already takes request — leave alone.
+            if 'request' in func_name:
+                return match.group(0)
+
+            # Compose the args we'll pass to the inner controller. If the
+            # wrapper was already passing arguments, preserve them and append
+            # `request`. Otherwise just pass `request`.
+            if existing_args:
+                # Don't double-add request if it's already passed.
+                if re.search(r'(?<![A-Za-z_])request(?![A-Za-z_])', existing_args):
+                    inner_args = existing_args
+                else:
+                    inner_args = f'{existing_args}, request'
+            else:
+                inner_args = 'request'
+
+            return (
+                f"{decorator}async def {func_name}(request: Request):\n"
+                f"{indent}return await {called_func}({inner_args})"
+            )
+
+        # Match: @router.verb(...)\nasync def name():\n    return [await] inner_func([args])
         result = re.sub(
-            r'(@[^\n]+\.(?:post|put|patch|delete|get)\([^\n]+\n)async def (\w+)\(\):\n(\s+)return (?:await )?(\w+)\(\)',
+            r'(@[^\n]+\.(?:post|put|patch|delete|get)\([^\n]+\n)'
+            r'async def (\w+)\(\):\n'
+            r'(\s+)return (?:await )?(\w+)\(([^)]*)\)',
             fix_wrapper,
-            result
+            result,
         )
         
-        # Ensure Request is imported if we injected it
-        if 'request: Request' in result and 'from fastapi import Request' not in result:
-             if 'from fastapi import' in result:
-                 result = re.sub(r'from fastapi import ([^\n]+)', r'from fastapi import \1, Request', result, count=1)
-             else:
-                 result = 'from fastapi import Request\n' + result
+        # Ensure Request is imported if we injected it. We must check ALL existing
+        # `from fastapi import ...` lines for `Request` (not just the literal
+        # `from fastapi import Request`), or we'll duplicate it.
+        if 'request: Request' in result:
+            already_imported = any(
+                re.search(r'(?<![A-Za-z_])Request(?![A-Za-z_])', m.group(1))
+                for m in re.finditer(r'from\s+fastapi(?:\.\w+)?\s+import\s+([^\n]+)', result)
+            )
+            if not already_imported:
+                if 'from fastapi import' in result:
+                    result = re.sub(
+                        r'from fastapi import ([^\n]+)',
+                        r'from fastapi import \1, Request',
+                        result,
+                        count=1,
+                    )
+                else:
+                    result = 'from fastapi import Request\n' + result
 
         # ===== PHASE 24: Inject JWT Implementation =====
         if 'create_access_token' in result and 'def create_access_token' not in result and 'from' not in result:
@@ -821,14 +901,18 @@ manager = ConnectionManager()
     
     def _post_process(self, code: str) -> str:
         """Post-process migrated code to fix common issues."""
-        # Remove duplicate imports
+        # Remove duplicate TOP-LEVEL imports only — keep function-local imports in place
         lines = code.split('\n')
         seen_imports = set()
         result = []
-        
+
         for line in lines:
             stripped = line.strip()
-            if stripped.startswith('from ') or stripped.startswith('import '):
+            is_top_level_import = (
+                (line.startswith('from ') or line.startswith('import '))
+                and (stripped.startswith('from ') or stripped.startswith('import '))
+            )
+            if is_top_level_import:
                 if stripped not in seen_imports:
                     seen_imports.add(stripped)
                     result.append(line)
