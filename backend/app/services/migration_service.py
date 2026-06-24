@@ -1,45 +1,26 @@
 """Batch migration service for processing entire projects."""
 
 import os
-import asyncio
 import zipfile
 import tempfile
 import shutil
 import re
-from pathlib import Path
-from typing import List, Dict, Any, Optional, Callable
-from dataclasses import dataclass, field
+from typing import List, Dict, Any, Optional
+from dataclasses import dataclass
 from datetime import datetime
 import logging
 
-from app.services.github_service import GitHubService, get_github_service
-from app.services.code_parser import parse_python_file, detect_flask_routes
+from app.services.github_service import get_github_service
+from app.services.code_parser import parse_python_file
 from app.agents.migration_agent import get_migration_agent
+# MigrationProgress now lives in job_store so a single migration owns its own
+# state (see job_store.py for why). Re-exported here for backwards-compatibility.
+from app.services.job_store import MigrationProgress
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
-class MigrationProgress:
-    """Tracks migration progress."""
-    total_files: int = 0
-    processed_files: int = 0
-    total_chunks: int = 0
-    processed_chunks: int = 0
-    current_file: str = ""
-    current_chunk: str = ""
-    status: str = "pending"
-    errors: List[str] = field(default_factory=list)
-    start_time: datetime = field(default_factory=datetime.now)
-    
-    @property
-    def percentage(self) -> float:
-        if self.total_chunks == 0:
-            return 0
-        return (self.processed_chunks / self.total_chunks) * 100
-
-
-@dataclass 
 class MigrationResult:
     """Result of a file migration."""
     source_path: str
@@ -52,252 +33,245 @@ class MigrationResult:
 
 
 class BatchMigrationService:
-    """Service for migrating entire projects."""
-    
+    """Service for migrating entire projects.
+
+    The service is *stateless* with respect to progress: each migration carries
+    its own :class:`MigrationProgress`, passed in by the caller. That makes
+    concurrent migrations correct (no shared mutable state) and keeps the
+    service safe to use as a singleton.
+    """
+
     def __init__(self):
         self.github = get_github_service()
         self.agent = get_migration_agent()
-        self.progress: Optional[MigrationProgress] = None
-        self._progress_callback: Optional[Callable] = None
-    
-    def set_progress_callback(self, callback: Callable):
-        """Set callback for progress updates."""
-        self._progress_callback = callback
-    
-    def _update_progress(self, **kwargs):
-        """Update progress and notify callback."""
-        if self.progress:
-            for key, value in kwargs.items():
-                setattr(self.progress, key, value)
-            if self._progress_callback:
-                self._progress_callback(self.progress)
-    
+
+    @staticmethod
+    def _detached_progress(kind: str = "local") -> MigrationProgress:
+        """A throwaway progress object for direct/programmatic calls."""
+        return MigrationProgress(migration_id=f"{kind}-direct", kind=kind)
+
+    @staticmethod
+    def _summarize(results: List["MigrationResult"]) -> Dict[str, Any]:
+        """Build the summary block. Average confidence is computed over files
+        that actually had chunks migrated, so copied (non-Flask) files no longer
+        inflate the score."""
+        migrated = [r for r in results if r.chunks_migrated > 0]
+        return {
+            "total_files": len(results),
+            "files_migrated": len(migrated),
+            "total_chunks": sum(r.chunks_migrated + r.chunks_failed for r in results),
+            "chunks_succeeded": sum(r.chunks_migrated for r in results),
+            "chunks_failed": sum(r.chunks_failed for r in results),
+            "average_confidence": (
+                sum(r.confidence for r in migrated) / len(migrated) if migrated else 0.0
+            ),
+        }
+
+    @staticmethod
+    def _rmtree_quiet(path: str) -> None:
+        """Remove a tree, tolerating read-only files (common with git on Windows)."""
+        def on_rm_error(func, p, exc_info):
+            import stat
+            try:
+                os.chmod(p, stat.S_IWRITE)
+                os.unlink(p)
+            except OSError:
+                pass
+        shutil.rmtree(path, onerror=on_rm_error)
+
     async def migrate_github_repo(
         self,
         repo_url: str,
         branch: str = "main",
         source_framework: str = "flask",
-        target_framework: str = "fastapi"
+        target_framework: str = "fastapi",
+        progress: Optional[MigrationProgress] = None,
     ) -> Dict[str, Any]:
         """
         Migrate a GitHub repository.
-        
+
         Returns:
-            Dict with output_path, results, and summary
+            Dict with zip_path, results, and summary
         """
-        self.progress = MigrationProgress(status="cloning")
-        self._update_progress()
-        
+        progress = progress or self._detached_progress("github")
+        progress.status = "running"
+        progress.start_step("fetch", label="Cloning repository", detail=repo_url)
+
+        output_dir = None
+        repo_path = None
         try:
             # Clone repository
             repo_path = self.github.clone_repo(repo_url, branch)
-            self._update_progress(status="analyzing")
-            
-            # Detect project structure
+
+            progress.start_step("analyze", detail="Detecting Flask project")
             detection = self.github.detect_flask_project(repo_path)
             if not detection['is_flask']:
                 raise ValueError("Not a Flask project - no Flask imports detected")
-            
-            # Find Python files
+
             python_files = self.github.find_python_files(repo_path)
-            self._update_progress(total_files=len(python_files), status="migrating")
-            
-            # Create output directory
+            progress.total_files = len(python_files)
+            progress.start_step("migrate", detail=f"{len(python_files)} files")
+
             output_dir = tempfile.mkdtemp(prefix="migratemate_output_")
-            
-            # Migrate each file
+
             results = []
             for i, file_path in enumerate(python_files):
-                self._update_progress(
-                    current_file=os.path.relpath(file_path, repo_path),
-                    processed_files=i
-                )
-                
+                progress.current_file = os.path.relpath(file_path, repo_path)
+                progress.touch()
                 result = await self._migrate_file(
                     file_path=file_path,
                     repo_path=repo_path,
                     output_dir=output_dir,
                     source_framework=source_framework,
-                    target_framework=target_framework
+                    target_framework=target_framework,
+                    progress=progress,
                 )
                 results.append(result)
-            
-            self._update_progress(
-                processed_files=len(python_files),
-                status="packaging"
-            )
-            
-            # Create output ZIP
+                progress.processed_files = i + 1
+                progress.touch()
+
+            progress.start_step("package", detail="Building ZIP")
             zip_path = self._create_output_zip(output_dir, repo_url)
-            
-            # Cleanup
-            self.github.cleanup(repo_path)
-            
-            def on_rm_error(func, path, exc_info):
-                # Handle read-only files (common with git)
-                import stat
-                os.chmod(path, stat.S_IWRITE)
-                os.unlink(path)
-                
-            shutil.rmtree(output_dir, onerror=on_rm_error)
-            
-            self._update_progress(status="completed")
-            
+
+            progress.finish()
+            summary = self._summarize(results)
             return {
                 "zip_path": zip_path,
                 "results": [self._result_to_dict(r) for r in results],
-                "summary": {
-                    "total_files": len(python_files),
-                    "files_migrated": len([r for r in results if r.chunks_migrated > 0]),
-                    "total_chunks": sum(r.chunks_migrated + r.chunks_failed for r in results),
-                    "chunks_succeeded": sum(r.chunks_migrated for r in results),
-                    "chunks_failed": sum(r.chunks_failed for r in results),
-                    "average_confidence": sum(r.confidence for r in results) / len(results) if results else 0
-                }
+                "summary": summary,
             }
-            
+
         except Exception as e:
             logger.error(f"Migration failed: {e}")
-            self._update_progress(status="failed", errors=[str(e)])
+            progress.fail_current(str(e))
             raise
+        finally:
+            if repo_path:
+                try:
+                    self.github.cleanup(repo_path)
+                except OSError:
+                    pass
+            if output_dir and os.path.exists(output_dir):
+                self._rmtree_quiet(output_dir)
     
     async def migrate_uploaded_zip(
         self,
         zip_path: str,
         source_framework: str = "flask",
-        target_framework: str = "fastapi"
+        target_framework: str = "fastapi",
+        progress: Optional[MigrationProgress] = None,
     ) -> Dict[str, Any]:
         """Migrate an uploaded ZIP file."""
-        self.progress = MigrationProgress(status="extracting")
-        
-        # Extract ZIP
-        extract_dir = tempfile.mkdtemp(prefix="migratemate_extract_")
-        with zipfile.ZipFile(zip_path, 'r') as zf:
-            zf.extractall(extract_dir)
-        
-        # Find the actual project root (might be nested)
-        project_root = self._find_project_root(extract_dir)
-        
-        self._update_progress(status="analyzing")
-        
-        # Find Python files
-        python_files = self.github.find_python_files(project_root)
-        self._update_progress(total_files=len(python_files), status="migrating")
-        
-        # Create output directory
-        output_dir = tempfile.mkdtemp(prefix="migratemate_output_")
-        
-        # Migrate each file
-        results = []
-        for i, file_path in enumerate(python_files):
-            self._update_progress(
-                current_file=os.path.relpath(file_path, project_root),
-                processed_files=i
-            )
-            
-            result = await self._migrate_file(
-                file_path=file_path,
-                repo_path=project_root,
-                output_dir=output_dir,
-                source_framework=source_framework,
-                target_framework=target_framework
-            )
-            results.append(result)
-        
-        self._update_progress(processed_files=len(python_files), status="packaging")
-        
-        # Create output ZIP
-        zip_path = self._create_output_zip(output_dir, "uploaded_project")
-        
-        # Cleanup
-        def on_rm_error(func, path, exc_info):
-            # Handle read-only files (common with git)
-            import stat
-            os.chmod(path, stat.S_IWRITE)
-            os.unlink(path)
+        progress = progress or self._detached_progress("upload")
+        progress.status = "running"
+        progress.start_step("fetch", label="Extracting archive")
 
-        shutil.rmtree(extract_dir, onerror=on_rm_error)
-        shutil.rmtree(output_dir, onerror=on_rm_error)
-        
-        self._update_progress(status="completed")
-        
-        return {
-            "zip_path": zip_path,
-            "results": [self._result_to_dict(r) for r in results],
-            "summary": {
-                "total_files": len(python_files),
-                "files_migrated": len([r for r in results if r.chunks_migrated > 0]),
+        extract_dir = tempfile.mkdtemp(prefix="migratemate_extract_")
+        output_dir = None
+        try:
+            with zipfile.ZipFile(zip_path, 'r') as zf:
+                self._safe_extract(zf, extract_dir)
+
+            project_root = self._find_project_root(extract_dir)
+
+            progress.start_step("analyze")
+            python_files = self.github.find_python_files(project_root)
+            progress.total_files = len(python_files)
+            progress.start_step("migrate", detail=f"{len(python_files)} files")
+
+            output_dir = tempfile.mkdtemp(prefix="migratemate_output_")
+
+            results = []
+            for i, file_path in enumerate(python_files):
+                progress.current_file = os.path.relpath(file_path, project_root)
+                progress.touch()
+                result = await self._migrate_file(
+                    file_path=file_path,
+                    repo_path=project_root,
+                    output_dir=output_dir,
+                    source_framework=source_framework,
+                    target_framework=target_framework,
+                    progress=progress,
+                )
+                results.append(result)
+                progress.processed_files = i + 1
+                progress.touch()
+
+            progress.start_step("package", detail="Building ZIP")
+            out_zip = self._create_output_zip(output_dir, "uploaded_project")
+
+            progress.finish()
+            return {
+                "zip_path": out_zip,
+                "results": [self._result_to_dict(r) for r in results],
+                "summary": self._summarize(results),
             }
-        }
-    
+        except Exception as e:
+            logger.error(f"Migration failed: {e}")
+            progress.fail_current(str(e))
+            raise
+        finally:
+            self._rmtree_quiet(extract_dir)
+            if output_dir and os.path.exists(output_dir):
+                self._rmtree_quiet(output_dir)
+
     async def migrate_local_directory(
         self,
         source_dir: str,
         output_dir: str,
         source_framework: str = "flask",
-        target_framework: str = "fastapi"
+        target_framework: str = "fastapi",
+        progress: Optional[MigrationProgress] = None,
     ) -> Dict[str, Any]:
         """
         Migrate a local directory.
-        
+
         Args:
             source_dir: Path to source Flask project
             output_dir: Path to output directory for FastAPI project
             source_framework: Source framework (flask)
             target_framework: Target framework (fastapi)
-            
+
         Returns:
             Dict with results and summary
         """
-        self.progress = MigrationProgress(status="analyzing")
-        self._update_progress()
-        
+        progress = progress or self._detached_progress("local")
+        progress.status = "running"
+        progress.start_step("analyze", detail=source_dir)
+
         try:
-            # Ensure output directory exists
             os.makedirs(output_dir, exist_ok=True)
-            
-            # Find Python files
+
             python_files = self.github.find_python_files(source_dir)
-            self._update_progress(total_files=len(python_files), status="migrating")
-            
-            # Migrate each file
+            progress.total_files = len(python_files)
+            progress.start_step("migrate", detail=f"{len(python_files)} files")
+
             results = []
             for i, file_path in enumerate(python_files):
-                self._update_progress(
-                    current_file=os.path.relpath(file_path, source_dir),
-                    processed_files=i
-                )
-                
+                progress.current_file = os.path.relpath(file_path, source_dir)
+                progress.touch()
                 result = await self._migrate_file(
                     file_path=file_path,
                     repo_path=source_dir,
                     output_dir=output_dir,
                     source_framework=source_framework,
-                    target_framework=target_framework
+                    target_framework=target_framework,
+                    progress=progress,
                 )
                 results.append(result)
-            
-            self._update_progress(
-                processed_files=len(python_files),
-                status="completed"
-            )
-            
+                progress.processed_files = i + 1
+                progress.touch()
+
+            progress.finish()
             return {
                 "output_dir": output_dir,
                 "results": [self._result_to_dict(r) for r in results],
-                "summary": {
-                    "total_files": len(python_files),
-                    "files_migrated": len([r for r in results if r.chunks_migrated > 0]),
-                    "total_chunks": sum(r.chunks_migrated + r.chunks_failed for r in results),
-                    "chunks_succeeded": sum(r.chunks_migrated for r in results),
-                    "chunks_failed": sum(r.chunks_failed for r in results),
-                    "average_confidence": sum(r.confidence for r in results) / len(results) if results else 0
-                }
+                "summary": self._summarize(results),
             }
-            
+
         except Exception as e:
             logger.error(f"Migration failed: {e}")
-            self._update_progress(status="failed", errors=[str(e)])
+            progress.fail_current(str(e))
             raise
     
     async def _migrate_file(
@@ -306,9 +280,11 @@ class BatchMigrationService:
         repo_path: str,
         output_dir: str,
         source_framework: str,
-        target_framework: str
+        target_framework: str,
+        progress: Optional[MigrationProgress] = None,
     ) -> MigrationResult:
         """Migrate a single file."""
+        progress = progress or self._detached_progress()
         relative_path = os.path.relpath(file_path, repo_path)
         output_path = os.path.join(output_dir, relative_path)
         
@@ -361,20 +337,20 @@ class BatchMigrationService:
         
         # Parse into chunks
         chunks = parse_python_file(source_content, relative_path)
-        self._update_progress(total_chunks=self.progress.total_chunks + len(chunks))
-        
+        progress.total_chunks += len(chunks)
+        progress.touch()
+
         # Build header
         migrated_parts = []
         chunks_migrated = 0
         chunks_failed = 0
         total_confidence = 0
-        
+
         for chunk in chunks:
-            self._update_progress(
-                current_chunk=chunk.name,
-                processed_chunks=self.progress.processed_chunks + 1
-            )
-            
+            progress.current_chunk = chunk.name
+            progress.processed_chunks += 1
+            progress.touch()
+
             # Skip ignored chunks (whitespace)
             if chunk.chunk_type == 'ignored':
                  migrated_parts.append(chunk.content)
@@ -736,6 +712,21 @@ app = FastAPI(title="Migrated API")
         # Clean up leading/trailing whitespace
         return '\n'.join(result_parts).strip() + '\n'
     
+    @staticmethod
+    def _safe_extract(zf: zipfile.ZipFile, dest_dir: str) -> None:
+        """Extract a ZIP, refusing any member that would escape ``dest_dir``.
+
+        Guards against "zip slip" — archive entries like ``../../etc/passwd`` or
+        absolute paths that would otherwise let an uploaded ZIP overwrite files
+        outside the extraction directory.
+        """
+        dest_root = os.path.realpath(dest_dir)
+        for member in zf.namelist():
+            target = os.path.realpath(os.path.join(dest_dir, member))
+            if target != dest_root and not target.startswith(dest_root + os.sep):
+                raise ValueError(f"Unsafe path in archive (zip slip blocked): {member!r}")
+        zf.extractall(dest_dir)
+
     def _find_project_root(self, extract_dir: str) -> str:
         """Find the actual project root in extracted ZIP."""
         # Check if there's a single directory at root

@@ -1,23 +1,16 @@
 """MigrateMate Migration Agent using Google Gemini for Flask to FastAPI conversion."""
 
-import os
 import re
 import asyncio
 import logging
 from typing import Dict, Any, Optional, List
-from dataclasses import dataclass, field
-from datetime import datetime
 from enum import Enum
 
-# Optional: Google Generative AI (Gemini)
-try:
-    import google.generativeai as genai
-    GEMINI_AVAILABLE = True
-except ImportError:
-    genai = None
-    GEMINI_AVAILABLE = False
-
 from app.core.config import settings
+
+# ``google.generativeai`` adds ~5s to import time, so it is imported lazily in
+# ``_configure_gemini`` (only when an agent is actually constructed) rather than
+# at module load. This keeps app startup and the test suite fast.
 
 logger = logging.getLogger(__name__)
 
@@ -172,21 +165,24 @@ class MigrationAgent:
         self._configure_gemini()
     
     def _configure_gemini(self):
-        """Configure Google Gemini API."""
-        if not GEMINI_AVAILABLE:
+        """Configure Google Gemini API (importing the SDK lazily)."""
+        api_key = settings.GEMINI_API_KEY
+        if not api_key:
+            logger.warning("No GEMINI_API_KEY found - migration agent will use pattern-based fallback")
+            return
+
+        try:
+            import google.generativeai as genai
+        except ImportError:
             logger.warning("google-generativeai package not installed - using pattern-based migration")
             return
-            
-        api_key = settings.GEMINI_API_KEY
-        if api_key:
-            genai.configure(api_key=api_key)
-            self._model = genai.GenerativeModel(
-                model_name="gemini-2.0-flash",
-                system_instruction=MIGRATION_SYSTEM_PROMPT
-            )
-            logger.info("Gemini API configured successfully")
-        else:
-            logger.warning("No GEMINI_API_KEY found - migration agent will use pattern-based fallback")
+
+        genai.configure(api_key=api_key)
+        self._model = genai.GenerativeModel(
+            model_name="gemini-2.0-flash",
+            system_instruction=MIGRATION_SYSTEM_PROMPT,
+        )
+        logger.info("Gemini API configured successfully")
     
     async def migrate_chunk(
         self,

@@ -1,0 +1,10 @@
+# Optional RAG / local-embedding dependencies.
+#
+# Only needed when ENABLE_VECTOR_SERVICES=true (semantic search over code via
+# local sentence-transformers embeddings + Qdrant). These are heavy (torch is
+# ~2GB) and are imported lazily, so the core migration path never loads them.
+#
+#   pip install -r requirements.txt -r requirements-rag.txt
+
+torch==2.3.0
+sentence-transformers==3.0.0
