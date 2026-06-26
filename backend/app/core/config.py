@@ -14,6 +14,21 @@ class Settings(BaseSettings):
     APP_ENV: Literal["development", "staging", "production"] = "development"
     DEBUG: bool = True
     SECRET_KEY: str = Field(default="change-me-in-production")
+
+    # Feature toggles — keep the core Flask→FastAPI migration fast and
+    # dependency-light. The RAG stack (embeddings/Qdrant/Neo4j) and the
+    # Postgres-backed project store are off by default; enable them only when
+    # the optional Docker services are actually running.
+    ENABLE_VECTOR_SERVICES: bool = False  # embeddings + Qdrant + Neo4j at startup
+    ENABLE_DATABASE: bool = False         # attempt Postgres init at startup
+    DB_ECHO: bool = False                 # SQLAlchemy statement logging
+
+    # CORS — comma-separated list of allowed origins for the frontend.
+    CORS_ORIGINS: str = "http://localhost:3000,http://127.0.0.1:3000"
+
+    @property
+    def cors_origins_list(self) -> list[str]:
+        return [o.strip() for o in self.CORS_ORIGINS.split(",") if o.strip()]
     
     # PostgreSQL
     POSTGRES_USER: str = "migratemate"

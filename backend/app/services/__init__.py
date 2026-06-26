@@ -13,7 +13,10 @@ from app.services.code_parser import (
 )
 
 from app.services.github_service import GitHubService, get_github_service
-from app.services.migration_service import BatchMigrationService, get_batch_migration_service, MigrationProgress
+from app.services.job_store import (
+    MigrationProgress, Step, StepState, MigrationJobStore, get_job_store,
+)
+from app.services.migration_service import BatchMigrationService, get_batch_migration_service
 
 __all__ = [
     "EmbeddingService", "get_embedding_service", "initialize_embedding_service",
@@ -22,5 +25,6 @@ __all__ = [
     "HybridRetrievalService", "RetrievalResult", "RetrievalContext", "get_hybrid_retrieval_service",
     "CodeParser", "code_parser", "parse_python_file", "detect_flask_routes", "detect_fastapi_routes",
     "GitHubService", "get_github_service",
-    "BatchMigrationService", "get_batch_migration_service", "MigrationProgress",
+    "BatchMigrationService", "get_batch_migration_service",
+    "MigrationProgress", "Step", "StepState", "MigrationJobStore", "get_job_store",
 ]

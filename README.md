@@ -1,204 +1,168 @@
 # MigrateMate
 
-MigrateMate is an automated tool that modernizes your Python web applications by converting them from Flask to FastAPI. Instead of rewriting code by hand, you simply upload your project, and the tool uses AI to intelligently translate it. It handles the hard work for you—like updating how your app handles web requests, fixing imports, and making your code run faster with modern features—ensuring the new version works correctly.
+MigrateMate converts Flask apps to FastAPI. Point it at a GitHub repo or upload a
+ZIP, and it rewrites your routes, request handling, and imports using Google
+Gemini, then hands back a ZIP of the FastAPI version. It watches each step as it
+runs and leaves `# TODO` comments where a human needs to take a look.
 
-### Key Simplifications Made:
+## What it converts
 
-- **"Neuro-symbolic"** → "Combines AI with strict code rules"
-- **"AST-driven parsing"** → "Understanding your code's structure"
-- **"RAG-ready"** → "Context-aware" (implied)
-- **"Deterministic validation"** → "Double-checks the results"
-- **"Asynchronous I/O"** → "Making your code run faster"
+- `Blueprint(...)` to `APIRouter(...)` (keeps your original variable names)
+- `@app.route(..., methods=[...])` to `@app.get` / `@app.post` / etc.
+- `request.json` / `request.data` to `await request.json()` / `await request.body()`
+  and adds `request: Request` to the function signature when it's used
+- `jsonify(...)` removed (FastAPI returns dicts directly)
+- `make_response(...)` to `JSONResponse(...)`
+- Flask-JWT-Extended, Flask-Caching, and Flask-SocketIO turned into FastAPI
+  equivalents or clearly marked TODOs
 
-## Why I Built This
+Files that aren't Flask-related are copied through unchanged.
 
-Code migration is tedious. I've seen teams spend weeks manually converting Flask apps to FastAPI, fixing the same patterns over and over. MigrateMate automates that process using Google's Gemini AI to understand code context and generate proper conversions, not just find-and-replace.
+## How it works
 
-The tool handles real-world Flask patterns:
-- Blueprint → APIRouter conversion (preserving your variable names)
-- `request.data` / `request.json` → proper async `await request.body()`
-- `make_response()` → `JSONResponse`
-- Flask-JWT-Extended → python-jose JWT implementation
-- SocketIO → FastAPI WebSocket patterns
-- Middleware and before_request hooks → TODO comments with migration guidance
+1. Parse each Python file into chunks (functions, classes, top-level code).
+2. Send each Flask chunk to Gemini with a focused prompt.
+3. Clean up the output (dedupe imports, fix decorators, organize the file).
+4. Package everything into a ZIP with a FastAPI `requirements.txt`.
 
-## How It Works
+If no Gemini key is set, it falls back to a pattern-based converter so the tool
+still works offline.
 
-1. **Parse** - The code parser breaks your Flask app into logical chunks (functions, classes, imports)
-2. **Analyze** - Each chunk is classified (router, controller, middleware, utility)
-3. **Migrate** - Gemini AI converts each chunk with context-aware prompts
-4. **Post-process** - Cleanup pass fixes common issues, deduplicates imports, organizes code
-5. **Package** - Output as a downloadable ZIP with updated requirements.txt
-
-## Quick Start
+## Quick start
 
 ### Prerequisites
 
 - Python 3.10+
-- Node.js 18+ (for the frontend)
-- Google Gemini API key ([get one here](https://makersuite.google.com/app/apikey))
-- Docker Desktop (optional, for PostgreSQL/Redis/Neo4j/Qdrant services)
+- Node.js 18+ (frontend)
+- A Google Gemini API key ([get one here](https://makersuite.google.com/app/apikey))
+- Docker is optional. The core migration needs only the Gemini key; the backend
+  starts in about a second without it. Postgres and the vector-search stack are
+  off by default and only matter if you set `ENABLE_DATABASE=true` or
+  `ENABLE_VECTOR_SERVICES=true` in `.env`.
 
-### Docker Setup (Optional Services)
-
-If you want to use PostgreSQL, Redis, Neo4j, or Qdrant:
-
-```bash
-# From the backend directory
-cd backend
-docker compose up -d
-
-# Verify services are running (you should see postgres, qdrant, redis, neo4j)
-docker ps
-
-# To stop services when done
-docker compose down
-```
-
-### Backend Setup
+### Backend
 
 ```bash
-# Navigate to backend directory (if not already there)
 cd backend
-
-# Create and activate virtual environment
 python -m venv venv
-venv\Scripts\activate  # Windows
-# source venv/bin/activate  # Mac/Linux
+venv\Scripts\activate          # Windows
+# source venv/bin/activate     # macOS/Linux
 
-# Install dependencies
 pip install -r requirements.txt
 
-# Set up environment
-cp .env.example .env
-# Edit .env and add your GEMINI_API_KEY
+cp .env.example .env           # then add your GEMINI_API_KEY
 
-# Run the server (this takes a moment to start)
 uvicorn app.main:app --reload --port 8000
-# Wait until you see: 🎉 MigrateMate is ready!
 ```
 
-### Frontend Setup
+Run the tests (offline, no key or Docker needed):
 
 ```bash
-# Navigate to frontend directory
+pytest
+```
+
+### Frontend
+
+```bash
 cd frontend
-
-# Install dependencies
 npm install
-
-# Run development server
 npm run dev
 ```
 
-Open http://localhost:3000 and you're good to go.
+Open http://localhost:3000.
 
-## Using MigrateMate
+### Optional services (Postgres / Qdrant / Neo4j / Redis)
 
-### Option 1: GitHub Repository
+Only needed with `ENABLE_DATABASE=true` or `ENABLE_VECTOR_SERVICES=true`. The
+vector stack also needs the heavier dependencies:
 
-1. Enter a GitHub URL like `https://github.com/username/flask-app` (not `.git`)
-2. Select the branch you want to migrate
-3. Click "Start Migration"
+```bash
+cd backend
+docker compose up -d
+pip install -r requirements-rag.txt
+```
 
-The tool clones the repo, finds all Python files, and processes them.
+## Using it
 
-### Option 2: ZIP Upload
+**GitHub:** paste a repo URL (e.g. `https://github.com/username/flask-app`),
+choose a branch, and start. The repo is cloned, scanned for Python files, and
+migrated.
 
-1. Upload a ZIP file of your Flask project
-2. Click "Start Migration"
+**ZIP upload:** drop in a ZIP of your Flask project. Same pipeline, local files.
 
-Same process, just local files instead of cloning.
+Either way you get a downloadable ZIP with the migrated code, your original file
+structure, a FastAPI `requirements.txt`, and TODO comments where manual review is
+needed (auth setup, middleware, websockets).
 
-### What You Get
+## API
 
-- A downloadable ZIP with your migrated FastAPI code
-- Original file structure preserved
-- `requirements.txt` with FastAPI dependencies
-- TODO comments where manual review is needed (auth setup, middleware conversion, etc.)
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/v1/batch/github` | Start a GitHub migration (returns a `migration_id`) |
+| POST | `/api/v1/batch/upload` | Upload a ZIP (returns a `migration_id`) |
+| GET | `/api/v1/batch/status/{id}` | Poll step-by-step progress |
+| GET | `/api/v1/batch/result/{id}` | Results plus a download link |
+| GET | `/api/v1/batch/download/{id}` | Download the migrated ZIP |
 
-## Project Structure
+Both start endpoints run in the background and return `202` with a
+`migration_id`. Poll `status/{id}` for the live step list
+(`queued → fetch → analyze → migrate → package → completed`). Downloads are
+resolved from the id on the server, so there's no way to request an arbitrary
+file path.
+
+## Configuration
+
+Everything lives in `backend/.env` (see `.env.example` for all options):
+
+```env
+GEMINI_API_KEY=your_api_key_here
+
+# Optional, all off by default:
+ENABLE_DATABASE=false          # Postgres-backed project store
+ENABLE_VECTOR_SERVICES=false   # embeddings + Qdrant + Neo4j
+CORS_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
+```
+
+The frontend reads `NEXT_PUBLIC_API_URL` (defaults to `http://localhost:8000`).
+
+## Project structure
 
 ```
 migratemate/
 ├── backend/
 │   ├── app/
-│   │   ├── agents/
-│   │   │   └── migration_agent.py    # Gemini AI integration & prompts
+│   │   ├── agents/migration_agent.py     # Gemini prompts + conversion
 │   │   ├── services/
-│   │   │   ├── migration_service.py  # Orchestrates file-by-file migration
-│   │   │   ├── code_parser.py        # AST-based Python parser
-│   │   │   └── github_service.py     # Clones repos, finds Python files
-│   │   ├── api/v1/
-│   │   │   └── batch.py              # REST endpoints for migration
+│   │   │   ├── migration_service.py      # orchestrates the migration
+│   │   │   ├── job_store.py              # per-migration progress + steps
+│   │   │   ├── code_parser.py            # AST-based parser
+│   │   │   └── github_service.py         # clone + file discovery
+│   │   ├── api/v1/batch.py              # migration endpoints
 │   │   └── main.py
+│   ├── tests/                           # offline test suite
 │   └── requirements.txt
-│
 ├── frontend/
-│   ├── src/
-│   │   ├── app/
-│   │   │   └── page.tsx              # Landing page
-│   │   └── components/
-│   │       ├── MigrationPanel.tsx    # Main migration UI
-│   │       └── CodeDiffViewer.tsx    # Side-by-side diff view
-│   └── package.json
-│
-└── docker-compose.yml                 # Optional: PostgreSQL, Redis, Neo4j and qdrant.
+│   └── src/components/
+│       ├── MigrationPanel.tsx           # main UI + progress
+│       └── CodeDiffViewer.tsx           # before/after diff
+└── docker-compose.yml                   # optional services
 ```
 
-## API Endpoints
+## Tech stack
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/api/v1/batch/github` | Start migration from GitHub URL |
-| POST | `/api/v1/batch/upload` | Upload ZIP for migration |
-| GET | `/api/v1/batch/status/{id}` | Poll migration progress |
-| GET | `/api/v1/batch/result/{id}` | Get migration results |
-| GET | `/api/v1/batch/download` | Download migrated ZIP |
+- Backend: FastAPI, Uvicorn, Google Gemini 2.0 Flash, Python AST
+- Frontend: Next.js 14, TypeScript, Tailwind CSS, Monaco editor, react-diff-viewer
 
-## Configuration
+## Limitations
 
-Create a `.env` file in the backend directory:
-
-```env
-GEMINI_API_KEY=your_api_key_here
-DATABASE_URL=sqlite:///./migratemate.db  # or PostgreSQL URL
-```
-
-## Tech Stack
-
-**Backend:**
-- FastAPI + Uvicorn
-- Google Gemini 2.0 Flash (for code migration)
-- Python AST (for parsing)
-
-**Frontend:**
-- Next.js 14 with App Router
-- TypeScript
-- Tailwind CSS
-- Monaco Editor (code viewing)
-- react-diff-viewer (side-by-side diffs)
-
-## Current Limitations
-
-This is a portfolio project, so there are some rough edges:
-
-- **WebSocket migration is incomplete** - SocketIO patterns get ConnectionManager scaffolding but need manual wiring
-- **Complex middleware chains** need manual review - the tool adds TODOs but doesn't fully convert them
-- **No authentication** on the API - this is a local development tool, not production-ready
-- **Rate limits** - Gemini API has quotas, large projects may need multiple runs
-
-## What I Learned Building This
-
-- LLM output is unpredictable - you need robust post-processing to catch edge cases
-- Chunk-by-chunk migration loses context - future versions should analyze cross-file dependencies
-- AST parsing is great for structure, but regex is still useful for quick pattern fixes
-- The 80/20 rule applies: 80% of files migrate cleanly, 20% need the most work
+- WebSocket conversion is partial: SocketIO gets a `ConnectionManager` scaffold
+  but needs manual wiring.
+- Complex middleware chains are flagged with TODOs rather than fully converted.
+- The API has no auth; it's a local dev tool, not production-ready.
+- Large projects can hit Gemini rate limits and may need a second run.
 
 ## License
 
-MIT - do whatever you want with it.
+MIT.
 
----
-
-Built by [Aditya Singh](https://github.com/asing508) demonstrating AI-powered code transformation.
+Built by [Aditya Singh](https://github.com/asing508).

@@ -1,10 +1,15 @@
-"""Local embedding service using sentence-transformers."""
+"""Local embedding service using sentence-transformers.
+
+``torch`` and ``sentence_transformers`` are imported lazily inside ``__init__``
+rather than at module top level. Those two packages alone add ~30s to a cold
+import, and the core Flask→FastAPI migration path never touches embeddings — so
+importing the app (and running the test suite) stays fast unless RAG is actually
+used.
+"""
 
 import asyncio
 from typing import List, Optional
 import logging
-import torch
-from sentence_transformers import SentenceTransformer
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -12,11 +17,15 @@ logger = logging.getLogger(__name__)
 
 class EmbeddingService:
     """Local embedding service - no external API calls."""
-    
+
     def __init__(self, model_name: str = None, device: str = None, batch_size: int = 32):
+        # Heavy ML deps are imported here, not at module load.
+        import torch
+        from sentence_transformers import SentenceTransformer
+
         self.model_name = model_name or settings.EMBEDDING_MODEL
         self.batch_size = batch_size
-        
+
         if device is None:
             if torch.cuda.is_available():
                 self.device = "cuda"
@@ -26,7 +35,7 @@ class EmbeddingService:
                 self.device = "cpu"
         else:
             self.device = device
-        
+
         logger.info(f"Loading embedding model '{self.model_name}' on {self.device}")
         self._model = SentenceTransformer(self.model_name, device=self.device)
         self._dimension = self._model.get_sentence_embedding_dimension()
